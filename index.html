@@ -582,7 +582,7 @@ const PdfService = {
     return this.pages.get(k);
   },
   joinText(tc) { return tc.items.map(i => (i.str || '') + (i.hasEOL ? ' ' : '')).join(''); },
-  reset() { this.docs.clear(); this.pages.clear(); },
+  reset() { this.docs.clear(); this.pages.clear(); TextGeometry.reset(); },
 };
 
 /* 頁面渲染佇列：一次只渲染一頁，只渲染看得到的 */
@@ -624,6 +624,72 @@ async function renderPageCanvas(id) {
   el._px = target;
 }
 
+/* ============================================================
+   TextGeometry：直接用 PDF 的座標算文字位置（不靠瀏覽器字型）
+   每個文字片段的左右邊界、基線與字高都來自 PDF 本身，所以在任何瀏覽器都準；
+   片段內各字元的位置用 canvas 量出比例，再套進 PDF 給的寬度裡。
+   ============================================================ */
+const TextGeometry = {
+  cache: new Map(),   // "fileId:page" → Promise<geo[]>
+  ctx: document.createElement('canvas').getContext('2d'),
+  get(fileId, n) {
+    const k = fileId + ':' + n;
+    if (!this.cache.has(k)) this.cache.set(k, this.build(fileId, n));
+    return this.cache.get(k);
+  },
+  async build(fileId, n) {
+    const page = await PdfService.getPage(fileId, n);
+    const tc = await page.getTextContent();
+    await page.getOperatorList().catch(() => {});
+    const vp = page.getViewport({ scale: 1 });
+    return tc.items.filter(i => i.str !== undefined).map(it => {
+      if (!it.str || !it.width) return null;
+      const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+      if (Math.abs(tx[1]) > 1e-3 || Math.abs(tx[2]) > 1e-3 || tx[0] <= 0) return null; // 只處理水平文字
+      const fh = Math.hypot(tx[2], tx[3]);
+      const st = tc.styles[it.fontName] || {};
+      const asc = Math.min(st.ascent || 0.8, 0.95), desc = Math.max(st.descent || -0.2, -0.3);
+      const font = fontInfo(page, it.fontName);
+      return {
+        str: it.str,
+        x: tx[4] / vp.width, w: it.width / vp.width,
+        y: (tx[5] - fh * asc) / vp.height, h: fh * (asc - desc) / vp.height,
+        css: `${font.italic ? 'italic ' : ''}${font.bold ? 'bold ' : ''}100px ${st.fontFamily || 'sans-serif'}`,
+      };
+    });
+  },
+  fracs(g) { // 每個字元邊界在片段內的位置（0–1）
+    if (g._fr) return g._fr;
+    const c = this.ctx;
+    c.font = g.css;
+    const total = c.measureText(g.str).width || 1;
+    const fr = [0];
+    for (let i = 1; i <= g.str.length; i++) fr.push(Math.min(1, c.measureText(g.str.slice(0, i)).width / total));
+    return (g._fr = fr);
+  },
+  rect(g, i0, i1) { // 第 i0～i1 個字元的矩形（相對頁面 0–1），自動略過前後空白
+    while (i0 < i1 && /\s/.test(g.str[i0])) i0++;
+    while (i1 > i0 && /\s/.test(g.str[i1 - 1])) i1--;
+    if (i1 <= i0) return null;
+    const fr = this.fracs(g);
+    return { x: g.x + g.w * fr[i0], y: g.y, w: g.w * (fr[i1] - fr[i0]), h: g.h };
+  },
+  reset() { this.cache.clear(); },
+};
+
+function fontInfo(page, fontName) {
+  let f = null;
+  try { if (page.commonObjs.has(fontName)) f = page.commonObjs.get(fontName); } catch { /* 尚未載入 */ }
+  const n = (f && f.name) || '';
+  return {
+    bold: !!f && (f.bold || f.black || /bold|black|heavy|semibold|demi|medi/i.test(n)),
+    italic: !!f && (f.italic || /italic|oblique|ital\b/i.test(n)),
+  };
+}
+
+/* 文字層的 span 與 PDF 文字片段一一對應（index 相同），找不到時回傳 -1 */
+function spanIndex(span) { return span && span._ti !== undefined ? span._ti : -1; }
+
 function ensureTextLayer(el, it) {
   if (el._tlW === it.w && el._tlPromise) return el._tlPromise;
   el._tlW = it.w;
@@ -642,8 +708,10 @@ function ensureTextLayer(el, it) {
     const textDivs = [];
     await pdfjsLib.renderTextLayer({ textContentSource: tc, container: div, viewport: vp, textDivs }).promise;
     const items = tc.items.filter(i => i.str !== undefined);
+    textDivs.forEach((d, i) => { d._ti = items[i] && items[i].str === d.textContent ? i : -1; });
     applyFontStyles(page, items, textDivs);
     fitTextDivs(items, textDivs, vp.scale);
+    el._geo = await TextGeometry.get(it.fileId, it.page);
   })().catch(err => console.warn('text layer failed', err));
   return el._tlPromise;
 }
@@ -656,12 +724,9 @@ function applyFontStyles(page, items, divs) {
   divs.forEach((d, i) => {
     const it = items[i];
     if (!it || !it.fontName) return;
-    let f = null;
-    try { if (page.commonObjs.has(it.fontName)) f = page.commonObjs.get(it.fontName); } catch { return; }
-    if (!f) return;
-    const n = f.name || '';
-    if (f.bold || f.black || /bold|black|heavy|semibold|demi|medi/i.test(n)) d.style.fontWeight = 'bold';
-    if (f.italic || /italic|oblique|ital\b/i.test(n)) d.style.fontStyle = 'italic';
+    const f = fontInfo(page, it.fontName);
+    if (f.bold) d.style.fontWeight = 'bold';
+    if (f.italic) d.style.fontStyle = 'italic';
   });
 }
 
@@ -865,24 +930,47 @@ function normRect(r, cr) {
   return { x: (r.left - cr.left) / cr.width, y: (r.top - cr.top) / cr.height, w: r.width / cr.width, h: r.height / cr.height };
 }
 
-function captureHighlight() {
+/* 螢光筆：用選取範圍判斷「選了哪些字」，位置則由 TextGeometry 依 PDF 座標算出，不會超出文字 */
+async function captureHighlight() {
   const s = window.getSelection();
   if (!s || s.isCollapsed || !s.rangeCount) return;
   const range = s.getRangeAt(0), text = s.toString().replace(/\s+/g, ' ').trim();
   if (!text) return;
-  const made = [];
+  const picks = [];
   for (const it of Object.values(State.doc.items)) {
     if (it.type !== 'pdfPage') continue;
     const el = elMap.get(it.id), tl = el.querySelector('.textLayer');
     if (!range.intersectsNode(tl)) continue;
+    const spans = [];
+    for (const span of tl.querySelectorAll('span')) {
+      const node = span.firstChild;
+      if (!node || node.nodeType !== 3 || !range.intersectsNode(span)) continue;
+      let a = 0, b = node.length;
+      if (range.startContainer === node) a = range.startOffset;
+      else if (range.startContainer === span) a = range.startOffset > 0 ? node.length : 0;
+      if (range.endContainer === node) b = range.endOffset;
+      else if (range.endContainer === span) b = range.endOffset > 0 ? node.length : 0;
+      if (b > a) spans.push({ span, a, b });
+    }
+    if (spans.length) picks.push({ it, el, spans });
+  }
+  s.removeAllRanges();
+  const made = [];
+  for (const { it, el, spans } of picks) {
+    const geo = await TextGeometry.get(it.fileId, it.page).catch(() => []);
     const cr = el.getBoundingClientRect();
-    const rects = [...range.getClientRects()]
-      .filter(r => r.width > 1 && r.height > 1 && r.left >= cr.left - 2 && r.right <= cr.right + 2 && r.top >= cr.top - 2 && r.bottom <= cr.bottom + 2)
-      .map(r => normRect(r, cr));
+    const rects = [];
+    for (const { span, a, b } of spans) {
+      const g = geo[spanIndex(span)];
+      if (g) { const r = TextGeometry.rect(g, a, b); if (r) rects.push(r); continue; }
+      const rg = document.createRange(); // 後備：用瀏覽器排版的位置
+      rg.setStart(span.firstChild, a); rg.setEnd(span.firstChild, b);
+      const r = rg.getBoundingClientRect();
+      if (r.width > 1) rects.push(normRect(r, cr));
+    }
     const merged = mergeRects(rects);
     if (merged.length) made.push({ id: uid(), fileId: it.fileId, page: it.page, rects: merged, text, color: 'yellow' });
   }
-  s.removeAllRanges();
   if (made.length) dispatch({ type: 'ADD_HIGHLIGHTS', highlights: made });
 }
 
@@ -977,10 +1065,13 @@ function anchorAt(pageItem, cx, cy) {
     if (h.fileId !== pageItem.fileId || h.page !== pageItem.page) continue;
     if (h.rects.some(r => nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h)) return { kind: 'text', rects: h.rects, text: h.text };
   }
+  const geo = TextGeometry.cache.has(pageItem.fileId + ':' + pageItem.page) ? el._geo : null;
   for (const span of el.querySelectorAll('.textLayer span')) {
     const r = span.getBoundingClientRect();
     if (r.width && cx >= r.left && cx <= r.right && cy >= r.top - 2 && cy <= r.bottom + 2 && span.textContent.trim()) {
-      return { kind: 'text', rects: [normRect(r, cr)], text: span.textContent.trim() };
+      const g = geo && geo[spanIndex(span)];
+      const gr = g && TextGeometry.rect(g, 0, g.str.length);
+      return { kind: 'text', rects: [gr || normRect(r, cr)], text: span.textContent.trim() };
     }
   }
   return null;
@@ -1421,39 +1512,31 @@ const Search = {
     const rc = itemRect(it), z = Math.max(State.view.zoom, 1);
     await View.centerOn(rc.x + rc.w / 2, rc.y + rc.h / 2, z);
     const el = elMap.get(it.id);
-    await ensureTextLayer(el, it);
-    const cur = this.markHits(el, r.occ);
-    if (cur && this.idx === i) {
-      const cr = el.getBoundingClientRect(), mr = cur.getBoundingClientRect();
-      const nx = (mr.left + mr.width / 2 - cr.left) / cr.width, ny = (mr.top + mr.height / 2 - cr.top) / cr.height;
-      View.centerOn(rc.x + nx * rc.w, rc.y + ny * rc.h, z);
-    }
+    const geo = await TextGeometry.get(it.fileId, it.page).catch(() => []);
+    if (this.idx !== i) return;
+    const cur = this.markHits(el, geo, r.occ);
+    if (cur) View.centerOn(rc.x + (cur.x + cur.w / 2) * rc.w, rc.y + (cur.y + cur.h / 2) * rc.h, z);
   },
-  markHits(el, occ) {
-    const layer = el.querySelector('.hit-layer'), cr = el.getBoundingClientRect(), ql = this.q.toLowerCase();
-    const marks = [];
-    for (const span of el.querySelectorAll('.textLayer span')) {
-      const node = span.firstChild;
-      if (!node || node.nodeType !== 3) continue;
-      const tl = node.data.toLowerCase();
+  markHits(el, geo, occ) { // 依 PDF 座標畫出命中框，回傳目前這筆的矩形
+    const layer = el.querySelector('.hit-layer'), ql = this.q.toLowerCase();
+    const hits = [];
+    for (const g of geo) {
+      if (!g) continue;
+      const tl = g.str.toLowerCase();
       let from = 0, i;
       while ((i = tl.indexOf(ql, from)) !== -1) {
-        const range = document.createRange();
-        range.setStart(node, i);
-        range.setEnd(node, Math.min(node.length, i + ql.length));
-        const r = range.getBoundingClientRect();
-        if (r.width) {
-          const n = normRect(r, cr), m = document.createElement('div');
-          m.className = 'search-hit';
-          Object.assign(m.style, { left: n.x * 100 + '%', top: n.y * 100 + '%', width: n.w * 100 + '%', height: n.h * 100 + '%' });
-          layer.appendChild(m);
-          marks.push(m);
-        }
+        const r = TextGeometry.rect(g, i, i + ql.length);
+        if (r) hits.push(r);
         from = i + ql.length;
       }
     }
-    const cur = marks[occ] || marks[0];
-    if (cur) cur.classList.add('current');
+    const cur = hits[occ] || hits[0];
+    for (const r of hits) {
+      const m = document.createElement('div');
+      m.className = 'search-hit' + (r === cur ? ' current' : '');
+      Object.assign(m.style, { left: r.x * 100 + '%', top: r.y * 100 + '%', width: r.w * 100 + '%', height: r.h * 100 + '%' });
+      layer.appendChild(m);
+    }
     return cur;
   },
 };
