@@ -272,6 +272,7 @@ svg.icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-w
 /* ---------- CONFIG：常數集中在這裡 ---------- */
 const CONFIG = {
   TEXT_LAYER_ZOOM: 0.75,      // 縮放 ≥ 此值時啟用 PDF 文字層
+  TEXT_LAYER_SCALE: 4,        // 文字層先放大 4 倍建立再縮回，避開瀏覽器「最小字型」設定造成的偏移
   MIN_ZOOM: 0.1,
   MAX_ZOOM: 4,
   PAGE_WIDTH: 600,            // 匯入時每頁卡片的寬度（畫布座標）
@@ -629,12 +630,14 @@ function ensureTextLayer(el, it) {
   el._tlPromise = (async () => {
     const page = await PdfService.getPage(it.fileId, it.page);
     const pw = page.getViewport({ scale: 1 }).width;
-    const vp = page.getViewport({ scale: it.w / pw });
+    const k = CONFIG.TEXT_LAYER_SCALE;
+    const vp = page.getViewport({ scale: it.w / pw * k });
     const tc = await page.getTextContent();
     if (el._tlW !== it.w) return;
     const div = el.querySelector('.textLayer');
     div.innerHTML = '';
     div.style.setProperty('--scale-factor', vp.scale);
+    div.style.transform = `scale(${1 / k})`;
     await pdfjsLib.renderTextLayer({ textContentSource: tc, container: div, viewport: vp, textDivs: [] }).promise;
   })().catch(err => console.warn('text layer failed', err));
   return el._tlPromise;
