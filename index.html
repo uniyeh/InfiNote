@@ -638,9 +638,27 @@ function ensureTextLayer(el, it) {
     div.innerHTML = '';
     div.style.setProperty('--scale-factor', vp.scale);
     div.style.transform = `scale(${1 / k})`;
-    await pdfjsLib.renderTextLayer({ textContentSource: tc, container: div, viewport: vp, textDivs: [] }).promise;
+    const textDivs = [];
+    await pdfjsLib.renderTextLayer({ textContentSource: tc, container: div, viewport: vp, textDivs }).promise;
+    fitTextDivs(tc.items.filter(i => i.str !== undefined), textDivs, vp.scale);
   })().catch(err => console.warn('text layer failed', err));
   return el._tlPromise;
+}
+
+/* 用瀏覽器實際排版的寬度重新校正每個文字片段的水平縮放。
+   PDF.js 用 canvas 量字寬，但畫面上的字型可能不同（例如 lang="zh-Hant" 讓 Mac 改用蘋方、
+   或瀏覽器的最小字型設定），兩者不一致時，搜尋框、螢光筆和錨點都會往左或往右偏。 */
+function fitTextDivs(items, divs, scale) {
+  const jobs = [];
+  divs.forEach((d, i) => {
+    const it = items[i];
+    if (!it || !it.str || !it.width || it.transform[1] || it.transform[2]) return; // 跳過空字串與旋轉文字
+    jobs.push({ d, target: it.width * scale, rot: /rotate\([^)]*\)/.exec(d.style.transform || '') });
+  });
+  jobs.forEach(j => { j.w = j.d.offsetWidth; });             // 先全部讀（只觸發一次排版）
+  jobs.forEach(j => {                                          // 再全部寫
+    if (j.w > 0) j.d.style.transform = `${j.rot ? j.rot[0] + ' ' : ''}scaleX(${j.target / j.w})`;
+  });
 }
 
 let visTimer;
