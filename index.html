@@ -633,6 +633,7 @@ function ensureTextLayer(el, it) {
     const k = CONFIG.TEXT_LAYER_SCALE;
     const vp = page.getViewport({ scale: it.w / pw * k });
     const tc = await page.getTextContent();
+    await page.getOperatorList().catch(() => {}); // 確保字型資訊（粗體、斜體）已載入
     if (el._tlW !== it.w) return;
     const div = el.querySelector('.textLayer');
     div.innerHTML = '';
@@ -640,7 +641,9 @@ function ensureTextLayer(el, it) {
     div.style.transform = `scale(${1 / k})`;
     const textDivs = [];
     await pdfjsLib.renderTextLayer({ textContentSource: tc, container: div, viewport: vp, textDivs }).promise;
-    fitTextDivs(tc.items.filter(i => i.str !== undefined), textDivs, vp.scale);
+    const items = tc.items.filter(i => i.str !== undefined);
+    applyFontStyles(page, items, textDivs);
+    fitTextDivs(items, textDivs, vp.scale);
   })().catch(err => console.warn('text layer failed', err));
   return el._tlPromise;
 }
@@ -648,6 +651,20 @@ function ensureTextLayer(el, it) {
 /* 用瀏覽器實際排版的寬度重新校正每個文字片段的水平縮放。
    PDF.js 用 canvas 量字寬，但畫面上的字型可能不同（例如 lang="zh-Hant" 讓 Mac 改用蘋方、
    或瀏覽器的最小字型設定），兩者不一致時，搜尋框、螢光筆和錨點都會往左或往右偏。 */
+/* 依 PDF 字型名稱補上粗體／斜體（例如 NimbusRomNo9L-Medi），讓文字層的字寬分布更接近原文 */
+function applyFontStyles(page, items, divs) {
+  divs.forEach((d, i) => {
+    const it = items[i];
+    if (!it || !it.fontName) return;
+    let f = null;
+    try { if (page.commonObjs.has(it.fontName)) f = page.commonObjs.get(it.fontName); } catch { return; }
+    if (!f) return;
+    const n = f.name || '';
+    if (f.bold || f.black || /bold|black|heavy|semibold|demi|medi/i.test(n)) d.style.fontWeight = 'bold';
+    if (f.italic || /italic|oblique|ital\b/i.test(n)) d.style.fontStyle = 'italic';
+  });
+}
+
 function fitTextDivs(items, divs, scale) {
   const jobs = [];
   divs.forEach((d, i) => {
